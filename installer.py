@@ -230,7 +230,7 @@ def install():
         result=remote.operation(req);remote_created=True
         p.write(p.ETC/'known_hosts',remote.known_hosts(),0o640,p.USER)
         p.write(p.ETC/'ssh_config',ssh_config(config,result['user']),0o640,p.USER)
-        runtime={'port':config['port'],'excluded':sorted(excluded),'max_ttl':probe['max_ttl']}
+        runtime={'port':config['port'],'excluded':sorted(excluded),'max_ttl':probe['max_ttl'],'close_connections':True}
         p.write(p.ETC/'config.json',json.dumps(runtime,indent=2)+'\n',0o640,p.USER)
         p.write(p.APP/'tblockerbridge.py',code,0o755)
         first_snapshot()  # Verify restricted key + file permissions BEFORE firewall service.

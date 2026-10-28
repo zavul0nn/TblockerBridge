@@ -19,7 +19,7 @@ import time
 MAX_BYTES = 2 * 1024 * 1024
 TABLE = 'tblockerbridge'
 LOG = logging.getLogger('tblockerbridge')
-VERSION = '1.0.0'
+VERSION = '1.1.0'
 
 def decode(raw):
     if len(raw) > MAX_BYTES:
@@ -158,10 +158,12 @@ class Firewall:
                          f'add chain inet {t} input {{ type filter hook input priority -20; policy accept; }}',
                          f'add rule inet {t} input tcp dport {self.port} ip saddr @blocked_v4 counter drop']
         elements = []
+        applied = set()
         for ip, until in sorted(blocks.items()):
             ttl = int((until - now) * 1000)
             if ttl >= 1:
                 elements.append(f'{ip} timeout {ttl}ms')
+                applied.add(ip)
         if elements:
             commands.append(f'add element inet {t} blocked_v4 {{ ' + ', '.join(elements) + ' }')
         # nft -f commits the entire batch atomically: no unblocked window.
@@ -169,6 +171,73 @@ class Firewall:
                            text=True, capture_output=True, timeout=5)
         if p.returncode:
             raise RuntimeError('nft transaction failed: ' + p.stderr)
+        return applied
+
+def client_socket_command(ip, port, kill=False):
+    """Select only server-side TCP sockets for this exact frontend/client pair."""
+    address = ipaddress.ip_address(ip)
+    if address.version != 4 or str(address) != ip:
+        raise ValueError('expected canonical IPv4 client')
+    if type(port) is not int or not 1 <= port <= 65535 or port == 22:
+        raise ValueError('invalid frontend port')
+    # Include IPv4-mapped peers on dual-stack HAProxy listeners. Do not select
+    # listeners or mini-sockets (TIME_WAIT/SYN_RECV), which cannot carry data.
+    expression = f'( sport = :{port} and ( dst = {ip}/32 or dst = [::ffff:{ip}] ) )'
+    return ['/usr/bin/ss', *(['-K'] if kill else []), '-t', '-n', '-H',
+            'state', 'connected', 'exclude', 'bucket', expression]
+
+def close_client_sockets(ip, port):
+    killed = subprocess.run(client_socket_command(ip, port, kill=True),
+                            capture_output=True, text=True, timeout=3)
+    if killed.returncode:
+        raise RuntimeError('ss socket destroy failed: ' + killed.stderr.strip()[:300])
+    # ss -K can silently skip sockets unsupported by the kernel. Verify rather
+    # than claiming success from its exit code alone.
+    remaining = subprocess.run(client_socket_command(ip, port),
+                               capture_output=True, text=True, timeout=3)
+    if remaining.returncode or remaining.stdout.strip():
+        raise RuntimeError('client TCP sockets remain after ss -K')
+    return len(killed.stdout.splitlines())
+
+class BanEnforcer:
+    """Commit DROP first, then destroy client sockets; retry errors without unbanning."""
+    def __init__(self, firewall, close_connections=True):
+        self.firewall = firewall
+        self.enabled = close_connections
+        self.active = {}
+        self.closed = {}
+        self.last_failure = {}
+
+    def apply(self, blocks):
+        applied = self.firewall.apply(blocks)
+        self.active = {ip: blocks[ip] for ip in applied}
+        now = time.time()
+        self.closed = {ip: self.active[ip] for ip, until in self.closed.items()
+                       if ip in self.active and until > now}
+        self.last_failure = {ip: stamp for ip, stamp in self.last_failure.items() if ip in self.active}
+        self.retry()
+
+    def retry(self):
+        if not self.enabled:
+            return
+        deadline = time.monotonic() + 2
+        for ip, until in self.active.items():
+            if ip in self.closed or until <= time.time():
+                continue
+            if time.monotonic() >= deadline:
+                break
+            try:
+                count = close_client_sockets(ip, self.firewall.port)
+                self.closed[ip] = until
+                self.last_failure.pop(ip, None)
+                if count:
+                    LOG.info('Closed client TCP sockets: ip=%s port=%d count=%d', ip, self.firewall.port, count)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                now = time.monotonic()
+                if now - self.last_failure.get(ip, -1e9) >= 30:
+                    LOG.warning('TCP close pending: ip=%s port=%d; DROP remains active: %s',
+                                ip, self.firewall.port, error)
+                    self.last_failure[ip] = now
 
 def atomic_json(path, value):
     path = Path(path)
@@ -192,7 +261,8 @@ def mirror():
             blocks = validate_blocks(decode(cache.read_bytes()), time.time(), excluded, max_ttl)
         except (ValueError, OSError, TypeError):
             LOG.warning('Invalid cache ignored')
-    firewall = Firewall(port=cfg['port'], max_ttl=max_ttl)
+    firewall = BanEnforcer(Firewall(port=cfg['port'], max_ttl=max_ttl),
+                           close_connections=cfg.get('close_connections', True))
     firewall.apply(blocks)
     last_apply = time.monotonic()
     last_error = 0
@@ -227,6 +297,8 @@ def mirror():
                             LOG.info('State applied: active=%d', len(new))
                             blocks = new
                             last_apply = time.monotonic()
+                        else:
+                            firewall.retry()
                         if not connected:
                             LOG.info('Source connected; active=%d', len(blocks))
                             connected = True
